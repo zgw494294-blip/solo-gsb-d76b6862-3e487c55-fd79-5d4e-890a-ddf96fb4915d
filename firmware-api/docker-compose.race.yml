@@ -1,0 +1,13 @@
+# 仅用于“并发交错复现”的 Compose 覆盖层，不改变默认一键启动。
+# 用法：
+#   docker compose -f docker-compose.yml -f docker-compose.race.yml up --build
+# 它额外开启提交后挂点（FIRMWARE_TEST_PAUSE_DIR）并把宿主同路径目录挂入容器，
+# 供 scripts/race_repro.sh 通过“标记文件存在则暂停、删除则放行”制造确定性交错。
+# 持久卷 firmware-data 沿用主文件定义，不另起数据目录。
+services:
+  firmware-api:
+    environment:
+      FIRMWARE_TEST_PAUSE_DIR: /tmp/fw-pause
+    volumes:
+      - firmware-data:/data
+      - /tmp/fw-pause:/tmp/fw-pause

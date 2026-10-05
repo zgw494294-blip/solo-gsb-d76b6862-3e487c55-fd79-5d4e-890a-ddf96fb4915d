@@ -1,0 +1,21 @@
+services:
+  firmware-api:
+    build: .
+    image: dual-slot-firmware-api:latest
+    container_name: dual-slot-firmware-api
+    ports:
+      - "8000:8000"
+    environment:
+      FIRMWARE_DB_PATH: /data/firmware.db
+    volumes:
+      # 命名卷，首次 docker compose up 自动创建；分块与试启状态跨服务重启保留
+      - firmware-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  firmware-data:
