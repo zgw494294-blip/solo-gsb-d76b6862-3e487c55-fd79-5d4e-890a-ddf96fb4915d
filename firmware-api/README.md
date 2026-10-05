@@ -264,7 +264,8 @@ mkdir -p /tmp/fw-pause
 
 docker compose -f docker-compose.yml -f docker-compose.race.yml up --build -d
 
-bash scripts/race_repro.sh
+# 脚本可直接执行（也可 bash scripts/race_repro.sh）
+scripts/race_repro.sh
 ```
 
 脚本输出（PASS）：
@@ -292,7 +293,7 @@ FIRMWARE_DB_PATH=/tmp/fw-data/firmware.db \
 FIRMWARE_TEST_PAUSE_DIR=/tmp/fw-pause \
 uvicorn app.main:app --port 8000 &
 
-bash scripts/race_repro.sh
+scripts/race_repro.sh
 
 kill %1            # 复现结束，停止服务（数据保留在 /tmp/fw-data）
 ```
@@ -300,6 +301,12 @@ kill %1            # 复现结束，停止服务（数据保留在 /tmp/fw-data�
 脚本默认打 `http://localhost:8000`、标记目录取 `FIRMWARE_TEST_PAUSE_DIR`
 （未设置时为 `/tmp/fw-pause`），可用 `BASE_URL` / `FIRMWARE_TEST_PAUSE_DIR`
 环境变量覆盖。
+
+**解析依赖**：传输只需 `curl`；输出美化用的 `jq` 缺失也能跑；但长度核验
+依赖 `python3` —— 四处响应（挂起后的状态查询、声明 A、声明 B、终态查询）
+都必须由 `python3` 把正文**完整解析为 JSON**后，再按 `confirmed_slot` 取
+另一槽的 `declared_length`。语法非法、截断残缺或结构不符的响应一律判失败，
+不允许用文本片段（grep）或“以 `}` 结尾”之类的弱判定代替完整解析。
 
 超时配置（全部为可配置的有限等待，脚本不会无限挂起）：
 
@@ -312,10 +319,11 @@ kill %1            # 复现结束，停止服务（数据保留在 /tmp/fw-data�
   提前破坏交错；调整 `WAIT_MAX`/`REQ_MAX` 时它自动放大，也可显式覆盖。
 
 失败语义：任何一步失败——传输错误（curl 非零）、HTTP 错误（非 2xx）、
-响应不完整（非完整 JSON）或等待超时——脚本都会删除标记与 `.held`、
-终止并回收后台请求后以非零退出；只有三份完整有效的响应通过核验
-（A=3、B=6、终态=6）才报 PASS，残缺响应即使含有 `declared_length`
-片段也不予采信。
+响应无法完整解析为 JSON（语法非法 / 截断残缺 / 结构不符）或等待超时——
+脚本都会删除标记与 `.held`、终止并回收后台请求后以非零退出，且不打印
+PASS；只有四份完整有效的响应通过核验（挂起后=3、A=3、B=6、终态=6）才报
+PASS。即使 HTTP 200、curl 退出 0，残缺响应即使含有 `declared_length`
+片段（或以 `}` 结尾）也不予采信。
 
 ### 手工等价 HTTP 调用（想逐步执行时）
 
@@ -370,9 +378,20 @@ python3 test_race_repro.py              # race_repro.sh 传输异常回归（本
 - **提交失败不报成功（test_api.py 第 13 节）**：注入连接代理让 `commit`
   抛错，断言接口返回 5xx、库状态保持操作前、服务仍可继续处理请求。
 - **传输异常（test_race_repro.py）**：用本地可控传输桩（实现同一挂点协议）
-  驱动真实的 `scripts/race_repro.sh` 进程，覆盖三条路径：
+  驱动真实的 `scripts/race_repro.sh` 进程，覆盖七条路径：
   - 竞争声明的响应永不结束：脚本必须在 `REQ_MAX` 内报错退出（不绕过
     `WAIT_MAX` 挂住），并清理标记与 `.held`、终止回收后台请求；
   - 首请求放行后只收到含 `declared_length=3` 的残缺响应、curl 返回非零：
     脚本必须非零退出，不得误报 PASS；
-  - 成功路径：完整交错交互必须 PASS（A=3、B=6、终态=6）。
+  - 四处核验点（挂起后首次 `GET`、声明 B 的 `PUT` 响应、声明 A 放行后的
+    `PUT` 响应、终态第二次 `GET`）分别注入**传输成功（HTTP 200、curl
+    退出 0）但 JSON 语法非法（含预期长度且以 `}` 结尾）或正文残缺（含
+    长度片段）**的响应：脚本必须在完整 JSON 解析失败时非零退出、不打印
+    PASS，并清理标记与 `.held`、终止回收后台请求；
+  - 成功路径：完整交错交互必须 PASS（挂起后=3、A=3、B=6、终态=6）。
+
+  运行（`bash` + `curl` + `python3`，无外部服务依赖）：
+
+  ```bash
+  python3 test_race_repro.py
+  ```

@@ -5,7 +5,8 @@
 # 修复后必须分别为 3、6，且最终数据库状态为 6（等价某种串行执行）。
 #
 # 依赖服务以 FIRMWARE_TEST_PAUSE_DIR=<目录> 启动（见 README“并发交错复现”）。
-# 纯 curl，无第三方工具（jq 仅用于美化，缺失也能跑）。
+# 传输仅用 curl；jq 仅用于美化、缺失也能跑；长度核验依赖 python3 把响应
+# **完整解析为 JSON** 后再取值（不接受 grep 片段或“以 } 结尾”这类弱判定）。
 #
 # 确定性顺序（与 test_api.py 第 12 节的线程回归一致）：
 #   1. 放置挂点标记后发起声明 A；
@@ -19,10 +20,13 @@
 # 有限等待与失败语义（全部为可配置的有限等待，脚本不会无限挂起）：
 #   - 每个 HTTP 调用都有 curl --max-time 上限：普通调用用 REQ_MAX，
 #     首请求 A 用 A_MAX（预算覆盖正常暂停与竞争请求，不会提前破坏交错）；
-#   - 传输失败（curl 非零）、HTTP 错误（非 2xx）、响应不完整（非完整
-#     JSON）一律非零退出；退出前删除标记与 .held，并终止、回收后台请求；
-#   - 只有三份完整有效的响应通过核验（A=3、B=6、终态=6）才报 PASS，
-#     残缺响应即使含有 declared_length 片段也不予采信。
+#   - 传输失败（curl 非零）、HTTP 错误（非 2xx）、响应不是可完整解析的
+#     合法 JSON（语法非法、截断残缺、结构不符）一律非零退出；退出前删除
+#     标记与 .held，并终止、回收后台请求；
+#   - 挂起后状态查询、声明 A、声明 B、终态查询四处都必须先完整解析 JSON
+#     再取候选槽 declared_length；只有四份完整有效的响应通过核验
+#     （挂起后=3、A=3、B=6、终态=6）才报 PASS，残缺响应即使含有
+#     declared_length 片段、HTTP 200、curl 退出 0 也不予采信。
 set -u
 
 BASE=${BASE_URL:-http://localhost:8000}
@@ -72,15 +76,47 @@ trap cleanup EXIT
 
 jqf() { if command -v jq >/dev/null 2>&1; then jq "$@"; else cat; fi; }
 sha256_hex() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
-# 从整设备视图取“第一个非空 declared_length”（本例候选为 slot1；slot0 为
-# 已确认槽，declared_length 为 null，不会匹配至少一位数字的模式）。
-first_declared() { grep -o '"declared_length":[0-9][0-9]*' | head -1 | cut -d: -f2; }
 
-# 完整 JSON 对象校验：响应必须是完整对象（最后一个非空白字符为 }）。
-# 传输中断留下的残缺前缀即使包含 declared_length 片段也不算有效响应。
-json_complete() { # path
-  [ -s "$1" ] || return 1
-  [ "$(tr -d '[:space:]' < "$1" | tail -c 1)" = "}" ]
+# 长度核验依赖 python3 完整解析 JSON（无 jq 也可）
+command -v python3 >/dev/null 2>&1 || {
+  echo "FAIL: 需要 python3 完整解析响应 JSON 后再核验 declared_length" >&2
+  exit 1
+}
+
+# 把设备视图完整解析为 JSON，再取候选槽（与 confirmed_slot 相对的另一槽）的
+# declared_length；若缺少 confirmed_slot 字段，则回退为“第一个非空值”。
+# 解析失败（语法非法 / 截断残缺 / 结构不符）一律以非零退出，不产生长度：
+# 含 declared_length 片段的残缺前缀、或以 } 结尾的语法非法文本都过不了这关。
+# 合法 JSON 但值为 null（已确认槽）时输出空串并以 0 退出，由调用方与期望值比较。
+declared_of() { # path
+  python3 - "$1" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as f:
+        view = json.load(f)
+except (OSError, ValueError):
+    sys.exit(2)
+if not isinstance(view, dict) or not isinstance(view.get("slots"), dict):
+    sys.exit(2)
+confirmed = view.get("confirmed_slot")
+if confirmed in (0, 1):
+    slot = view["slots"].get(f"slot{1 - confirmed}")
+    if not isinstance(slot, dict) or "declared_length" not in slot:
+        sys.exit(2)
+    value = slot["declared_length"]
+else:
+    # 兼容缺少 confirmed_slot 的视图：取第一个非空 declared_length
+    value = None
+    for s in ("slot0", "slot1"):
+        slot = view["slots"].get(s)
+        if isinstance(slot, dict) and slot.get("declared_length") is not None:
+            value = slot["declared_length"]
+            break
+if value is not None and not isinstance(value, int):
+    sys.exit(2)
+print("" if value is None else value)
+PY
 }
 
 req() { # method path [json-body]：有限等待（REQ_MAX），HTTP 错误（非 2xx）即非零退出
@@ -135,16 +171,18 @@ echo ">> 等待 A 确认停在挂点（$HELD 出现；不能用数据库可见�
 wait_file "$HELD" "$WAIT_MAX" \
   || fail "未等到 A 进入挂点（.held 未出现），已释放挂点"
 # 附带核对：A 的写入已随 commit 落库（挂点在 commit 之后触发，必然可见）
-RESP=$(req GET "/devices/$DEV") || fail "查询设备状态失败（传输错误/超时/HTTP 错误）"
-L=$(printf '%s' "$RESP" | first_declared)
+req GET "/devices/$DEV" > "$OUT/held-view.json" \
+  || fail "挂起后查询设备状态失败（传输错误/超时/HTTP 错误）"
+L=$(declared_of "$OUT/held-view.json") \
+  || fail "挂起后查询响应不是可完整解析的合法 JSON，不予采信"
 [ "$L" = "3" ] || fail "A 已挂起但库中 declared_length=$L（期望 3）"
 echo "   A 已提交且停在返回前（库中=3）"
 
 echo ">> 在 A 返回前，完整执行声明 B（length=6）"
 req PUT "/devices/$DEV/update" "$(printf '{"length":6,"sha256":"%s"}' "$SHA6")" \
   > "$OUT/respB.json" || fail "声明 B 请求失败（传输错误/超时/HTTP 错误）"
-json_complete "$OUT/respB.json" || fail "B 的响应不是完整 JSON（传输中断），不予采信"
-LB=$(first_declared < "$OUT/respB.json")
+LB=$(declared_of "$OUT/respB.json") \
+  || fail "B 的响应不是可完整解析的合法 JSON，不予采信"
 [ "$LB" = "6" ] || fail "B 自身响应应为 6，实际：$LB"
 
 echo ">> 确认 A 的响应仍未返回，然后删除 .held 放行"
@@ -165,11 +203,13 @@ wait "$PID_A" || RC_A=$?
 PID_A=""
 # curl 非零（如 18 传输残缺、28 超时）：响应文件里的内容一律不予采信
 [ "$RC_A" -eq 0 ] || fail "A 的传输失败（curl 退出码 $RC_A）：响应可能残缺，不予采信"
-json_complete "$OUT/respA.json" || fail "A 的响应不是完整 JSON（传输中断），不予采信"
+LA=$(declared_of "$OUT/respA.json") \
+  || fail "A 的响应不是可完整解析的合法 JSON，不予采信"
 
-LA=$(first_declared < "$OUT/respA.json")
-RESP=$(req GET "/devices/$DEV") || fail "查询最终状态失败（传输错误/超时/HTTP 错误）"
-FINAL=$(printf '%s' "$RESP" | first_declared)
+req GET "/devices/$DEV" > "$OUT/final-view.json" \
+  || fail "查询最终状态失败（传输错误/超时/HTTP 错误）"
+FINAL=$(declared_of "$OUT/final-view.json") \
+  || fail "终态查询响应不是可完整解析的合法 JSON，不予采信"
 
 echo
 echo "A 响应 declared_length = $LA   （期望 3）"
