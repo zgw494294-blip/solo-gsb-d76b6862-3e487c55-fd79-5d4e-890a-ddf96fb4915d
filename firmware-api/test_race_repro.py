@@ -1,7 +1,7 @@
 """race_repro.sh 传输异常回归：本地可控传输桩 + 真实脚本进程。
 
 桩实现与服务相同的挂点协议（FIRMWARE_TEST_PAUSE_DIR 标记文件），
-scripts/race_repro.sh 无需任何修改即可运行在桩上。覆盖三条路径：
+scripts/race_repro.sh 无需任何修改即可运行在桩上。覆盖以下路径：
 
   1. 竞争停滞：竞争声明 B 的响应永不结束 —— 脚本必须在 REQ_MAX 内
      报错退出（修复前 B 的 curl 无超时，会绕过 WAIT_MAX 无限挂住），
@@ -9,7 +9,14 @@ scripts/race_repro.sh 无需任何修改即可运行在桩上。覆盖三条路�
   2. 首响应残缺：首请求 A 放行后只收到含 "declared_length":3 的残缺
      响应、curl 返回非零 —— 脚本必须非零退出（修复前丢弃 curl 退出码，
      会误报 PASS）；
-  3. 成功路径：完整交错交互 —— 脚本必须报 PASS（A=3、B=6、终态=6）。
+  3. 成功路径：完整交错交互 —— 脚本必须报 PASS（A=3、B=6、终态=6）；
+  4. 传输成功但 JSON 非法/残缺（HTTP 200、Content-Length 自洽、curl
+     退出 0，专杀“看结尾 } + grep 长度”的浅校验），分别注入到：
+       - 声明 A 的响应：含 "declared_length":3、以 } 结尾但语法非法；
+       - 声明 B 的响应：含 "declared_length":6、以 } 结尾但语法非法；
+       - 挂起后的 GET 查询：正文残缺但含 "declared_length":3；
+       - 终态 GET 查询：正文残缺但含 "declared_length":6。
+     脚本必须完整解析 JSON，解析失败即非零退出，不得误报 PASS。
 
 运行：python3 test_race_repro.py
 """
@@ -40,16 +47,19 @@ class StubHandler(BaseHTTPRequestHandler):
     """可控传输桩：固件 API 必要端点 + 挂点协议 + 故障注入。"""
 
     # 由测试场景在启动前配置（测试串行执行，类属性即可）
-    mode = "ok"            # ok | stall_b | truncated_a
+    mode = "ok"            # ok | stall_b | truncated_a | bad_json_a | bad_json_b
+                           # | bad_json_held_get | bad_json_final_get
     pause_dir = None
     declared = {}          # device_id -> declared_length
+    get_counts = {}        # device_id -> 已响应的 GET /devices/{id} 次数
+                           # （脚本时序固定：第 1 次为挂起后核对，第 2 次为终态查询）
 
     protocol_version = "HTTP/1.1"  # 响应均带 Content-Length，连接语义明确
 
     def log_message(self, *args):
         pass  # 静默
 
-    # 与真服务相同的紧凑 JSON（无空格分隔符）：脚本靠 grep '"declared_length":N' 提取
+    # 与真服务相同的紧凑 JSON（无空格分隔符）
     def _view(self, dev):
         return {
             "device_id": dev,
@@ -62,6 +72,10 @@ class StubHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, code, obj):
         body = json.dumps(obj, separators=(",", ":")).encode()
+        self._send_raw(code, body)
+
+    def _send_raw(self, code, body):
+        # Content-Length 与实际发送一致：HTTP 层传输成功，curl 退出 0
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -70,6 +84,28 @@ class StubHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except BrokenPipeError:
             pass  # 对端（被脚本终止的 curl）已断开，属预期内的清理路径
+
+    def _slot1_value_end(self, view):
+        """给定视图的紧凑 JSON 中，slot1 的 declared_length 值（数字）之后的位置。"""
+        full = json.dumps(view, separators=(",", ":")).encode()
+        key = b'"declared_length":'
+        i = full.index(key, full.index(key) + 1) + len(key)  # slot1 值的起点
+        while full[i:i + 1].isdigit():
+            i += 1
+        return full, i
+
+    def _invalid_json_with_length(self, view):
+        """含该视图 declared_length、以 } 结尾但语法非法的响应体（花括号不配对）。
+        传输完全成功（HTTP 200、Content-Length 自洽、curl 退出 0），
+        专杀“看结尾 } + grep 长度”的浅校验。"""
+        full, i = self._slot1_value_end(view)
+        return full[:i] + b"}"  # 前缀恰含完整 "declared_length":N，补 } 仍不配对
+
+    def _truncated_json_with_length(self, view):
+        """残缺前缀：恰含完整 "declared_length":N，其后内容缺失（不以 } 结尾）。
+        传输完全成功（Content-Length 与前缀一致，curl 退出 0）。"""
+        full, i = self._slot1_value_end(view)
+        return full[:i]
 
     # 挂点协议：与 app/main.py 的 after_commit_hook 相同 —— 第一个命中标记的
     # 请求原子接管（rename 为 .held）并阻塞到 .held 被删除，其余请求直接放行
@@ -95,7 +131,17 @@ class StubHandler(BaseHTTPRequestHandler):
             return
         m = re.fullmatch(r"/devices/([^/]+)", self.path)
         if m:
-            self._send_json(200, self._view(m.group(1)))
+            dev = m.group(1)
+            self.get_counts[dev] = self.get_counts.get(dev, 0) + 1
+            n = self.get_counts[dev]
+            # 脚本时序固定：第 1 次 GET 为挂起后的落库核对，第 2 次为终态查询
+            if self.mode == "bad_json_held_get" and n == 1:
+                self._send_raw(200, self._truncated_json_with_length(self._view(dev)))
+                return
+            if self.mode == "bad_json_final_get" and n == 2:
+                self._send_raw(200, self._truncated_json_with_length(self._view(dev)))
+                return
+            self._send_json(200, self._view(dev))
             return
         self._send_json(404, {"detail": "not found"})
 
@@ -139,6 +185,15 @@ class StubHandler(BaseHTTPRequestHandler):
             self.wfile.write(full[:i])  # 前缀恰含完整 "declared_length":3
             self.close_connection = True
             return
+        if self.mode == "bad_json_a" and held:
+            # 首请求（A）：传输成功但响应语法非法（含本次声明长度 3、以 } 结尾）。
+            # 用挂起前生成的快照 view —— 与真服务“写事务内生成快照”语义一致
+            self._send_raw(200, self._invalid_json_with_length(view))
+            return
+        if self.mode == "bad_json_b" and not held:
+            # 竞争请求（B）：传输成功但响应语法非法（含本次声明长度 6、以 } 结尾）
+            self._send_raw(200, self._invalid_json_with_length(view))
+            return
         self._send_json(200, view)
 
 
@@ -146,6 +201,7 @@ def start_stub(mode, pause_dir):
     StubHandler.mode = mode
     StubHandler.pause_dir = pause_dir
     StubHandler.declared = {}
+    StubHandler.get_counts = {}
     server = ThreadingHTTPServer(("127.0.0.1", 0), StubHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -245,5 +301,39 @@ with tempfile.TemporaryDirectory() as pause_dir, \
     check("fails fast", elapsed < 20, f"elapsed={elapsed:.1f}s")
     check("marker and .held cleaned", pause_dir_clean(pause_dir))
     check("no leftover curl", no_leftover_curl(port))
+
+print("== 4. 传输成功（HTTP 200、curl 退出 0）但 JSON 非法/残缺："
+      "完整解析必须失败，不得误报 PASS ==")
+# 旧脚本的浅校验（看结尾 } + grep 长度片段）在这四处都会误采信：
+# 声明响应只看结尾 }，两次 GET 甚至不做任何完整性检查
+for mode, title, fragment in [
+    ("bad_json_a", "声明 A 的响应：含 declared_length=3、以 } 结尾但语法非法",
+     "A 的响应"),
+    ("bad_json_b", "声明 B 的响应：含 declared_length=6、以 } 结尾但语法非法",
+     "B 的响应"),
+    ("bad_json_held_get", "挂起后 GET 查询：正文残缺但含 declared_length=3",
+     "挂起后查询"),
+    ("bad_json_final_get", "终态 GET 查询：正文残缺但含 declared_length=6",
+     "终态查询"),
+]:
+    print(f"-- {mode}：{title}")
+    with tempfile.TemporaryDirectory() as pause_dir, \
+            tempfile.TemporaryDirectory() as out_dir:
+        server = start_stub(mode, pause_dir)
+        port = server.server_address[1]
+        try:
+            proc, elapsed = run_script(port, pause_dir, out_dir,
+                                       wait_max=5, req_max=5, a_max=15, timeout=45)
+        finally:
+            server.shutdown()
+            server.server_close()
+        print(proc.stdout)
+        check("non-zero exit", proc.returncode != 0,
+              (proc.returncode, proc.stdout))
+        check("no PASS", "PASS" not in proc.stdout, proc.stdout)
+        check("reports JSON parse failure", fragment in proc.stderr, proc.stderr)
+        check("fails fast", elapsed < 20, f"elapsed={elapsed:.1f}s")
+        check("marker and .held cleaned", pause_dir_clean(pause_dir))
+        check("no leftover curl", no_leftover_curl(port))
 
 print(f"\nALL {PASS} CHECKS PASSED")
